@@ -15,10 +15,7 @@
 #include <stdio.h>
 #include <cmath>
 
-#if defined(NODE_HAVE_I18N_SUPPORT)
-#include <unicode/utf8.h>
-#include <unicode/utf.h>
-#endif
+#define UNICODE_REPLACEMENT_CHARACTER 0xFFFD
 
 namespace node {
 
@@ -30,9 +27,11 @@ using v8::HandleScope;
 using v8::Integer;
 using v8::Isolate;
 using v8::Local;
+using v8::MaybeLocal;
 using v8::Null;
 using v8::Object;
 using v8::String;
+using v8::TryCatch;
 using v8::Undefined;
 using v8::Value;
 
@@ -50,45 +49,6 @@ using v8::Value;
     }                                                                         \
   }
 
-#define CANNOT_BE_BASE() url.flags |= URL_FLAGS_CANNOT_BE_BASE;
-#define INVALID_PARSE_STATE() url.flags |= URL_FLAGS_INVALID_PARSE_STATE;
-#define SPECIAL()                                                             \
-  {                                                                           \
-    url.flags |= URL_FLAGS_SPECIAL;                                           \
-    special = true;                                                           \
-  }
-#define TERMINATE()                                                           \
-  {                                                                           \
-    url.flags |= URL_FLAGS_TERMINATED;                                        \
-    goto done;                                                                \
-  }
-#define FAILED()                                                              \
-  {                                                                           \
-    url.flags |= URL_FLAGS_FAILED;                                            \
-    goto done;                                                                \
-  }
-
-#define CHECK_FLAG(flags, name) (flags & URL_FLAGS_##name) /* NOLINT */
-
-#define IS_CANNOT_BE_BASE(flags) CHECK_FLAG(flags, CANNOT_BE_BASE)
-#define IS_FAILED(flags) CHECK_FLAG(flags, FAILED)
-
-#define DOES_HAVE_SCHEME(url) CHECK_FLAG(url.flags, HAS_SCHEME)
-#define DOES_HAVE_USERNAME(url) CHECK_FLAG(url.flags, HAS_USERNAME)
-#define DOES_HAVE_PASSWORD(url) CHECK_FLAG(url.flags, HAS_PASSWORD)
-#define DOES_HAVE_HOST(url) CHECK_FLAG(url.flags, HAS_HOST)
-#define DOES_HAVE_PATH(url) CHECK_FLAG(url.flags, HAS_PATH)
-#define DOES_HAVE_QUERY(url) CHECK_FLAG(url.flags, HAS_QUERY)
-#define DOES_HAVE_FRAGMENT(url) CHECK_FLAG(url.flags, HAS_FRAGMENT)
-
-#define SET_HAVE_SCHEME() url.flags |= URL_FLAGS_HAS_SCHEME;
-#define SET_HAVE_USERNAME() url.flags |= URL_FLAGS_HAS_USERNAME;
-#define SET_HAVE_PASSWORD() url.flags |= URL_FLAGS_HAS_PASSWORD;
-#define SET_HAVE_HOST() url.flags |= URL_FLAGS_HAS_HOST;
-#define SET_HAVE_PATH() url.flags |= URL_FLAGS_HAS_PATH;
-#define SET_HAVE_QUERY() url.flags |= URL_FLAGS_HAS_QUERY;
-#define SET_HAVE_FRAGMENT() url.flags |= URL_FLAGS_HAS_FRAGMENT;
-
 #define UTF8STRING(isolate, str)                                              \
   String::NewFromUtf8(isolate, str.c_str(), v8::NewStringType::kNormal)       \
     .ToLocalChecked()
@@ -96,52 +56,48 @@ using v8::Value;
 namespace url {
 
 #if defined(NODE_HAVE_I18N_SUPPORT)
-  static int ToUnicode(std::string* input, std::string* output) {
+  static inline bool ToUnicode(std::string* input, std::string* output) {
     MaybeStackBuffer<char> buf;
     if (i18n::ToUnicode(&buf, input->c_str(), input->length()) < 0)
-      return -1;
+      return false;
     output->assign(*buf, buf.length());
-    return 0;
+    return true;
   }
 
-  static int ToASCII(std::string* input, std::string* output) {
+  static inline bool ToASCII(std::string* input, std::string* output) {
     MaybeStackBuffer<char> buf;
     if (i18n::ToASCII(&buf, input->c_str(), input->length()) < 0)
-      return -1;
+      return false;
     output->assign(*buf, buf.length());
-    return 0;
-  }
-
-  // Unfortunately there's not really a better way to do this.
-  // Iterate through each encoded codepoint and verify that
-  // it is a valid unicode codepoint.
-  static int IsValidUTF8(std::string* input) {
-    const char* p = input->c_str();
-    int32_t len = input->length();
-    for (int32_t i = 0; i < len;) {
-      UChar32 c;
-      U8_NEXT_UNSAFE(p, i, c);
-      if (!U_IS_UNICODE_CHAR(c))
-        return -1;
-    }
-    return 0;
+    return true;
   }
 #else
   // Intentional non-ops if ICU is not present.
-  static int ToUnicode(std::string* input, std::string* output) {
-    output->reserve(input->length());
-    *output = input->c_str();
+  static inline bool ToUnicode(std::string* input, std::string* output) {
+    *output = *input;
+    return true;
   }
 
-  static int ToASCII(std::string* input, std::string* output) {
-    output->reserve(input->length());
-    *output = input->c_str();
-  }
-
-  static int IsValidUTF8(std::string* input) {
-    return 0;
+  static inline bool ToASCII(std::string* input, std::string* output) {
+    *output = *input;
+    return true;
   }
 #endif
+
+  // If a UTF-16 character is a low/trailing surrogate.
+  static inline bool IsUnicodeTrail(uint16_t c) {
+    return (c & 0xFC00) == 0xDC00;
+  }
+
+  // If a UTF-16 character is a surrogate.
+  static inline bool IsUnicodeSurrogate(uint16_t c) {
+    return (c & 0xF800) == 0xD800;
+  }
+
+  // If a UTF-16 surrogate is a low/trailing one.
+  static inline bool IsUnicodeSurrogateTrail(uint16_t c) {
+    return (c & 0x400) != 0;
+  }
 
   static url_host_type ParseIPv6Host(url_host* host,
                                      const char* input,
@@ -261,7 +217,7 @@ namespace url {
     return type;
   }
 
-  static inline int ParseNumber(const char* start, const char* end) {
+  static inline int64_t ParseNumber(const char* start, const char* end) {
     unsigned R = 10;
     if (end - start >= 2 && start[0] == '0' && (start[1] | 0x20) == 'x') {
       start += 2;
@@ -293,7 +249,7 @@ namespace url {
       }
       p++;
     }
-    return strtol(start, NULL, R);
+    return strtoll(start, NULL, R);
   }
 
   static url_host_type ParseIPv4Host(url_host* host,
@@ -305,7 +261,8 @@ namespace url {
     const char* end = pointer + length;
     int parts = 0;
     uint32_t val = 0;
-    unsigned numbers[4];
+    uint64_t numbers[4];
+    int tooBigNumbers = 0;
     if (length == 0)
       goto end;
 
@@ -313,20 +270,16 @@ namespace url {
       const char ch = pointer < end ? pointer[0] : kEOL;
       const int remaining = end - pointer - 1;
       if (ch == '.' || ch == kEOL) {
-        if (++parts > 4 || pointer - mark == 0)
-          break;
-        int n = ParseNumber(mark, pointer);
-        if (n < 0) {
-          type = HOST_TYPE_DOMAIN;
+        if (++parts > 4)
           goto end;
-        }
-        if (pointer - mark == 10) {
-          numbers[parts - 1] = n;
+        if (pointer - mark == 0)
           break;
-        }
+        int64_t n = ParseNumber(mark, pointer);
+        if (n < 0)
+          goto end;
+
         if (n > 255) {
-          type = HOST_TYPE_FAILED;
-          goto end;
+          tooBigNumbers++;
         }
         numbers[parts - 1] = n;
         mark = pointer + 1;
@@ -335,14 +288,23 @@ namespace url {
       }
       pointer++;
     }
+    CHECK_GT(parts, 0);
+
+    // If any but the last item in numbers is greater than 255, return failure.
+    // If the last item in numbers is greater than or equal to
+    // 256^(5 - the number of items in numbers), return failure.
+    if (tooBigNumbers > 1 ||
+        (tooBigNumbers == 1 && numbers[parts - 1] <= 255) ||
+        numbers[parts - 1] >= pow(256, static_cast<double>(5 - parts))) {
+      type = HOST_TYPE_FAILED;
+      goto end;
+    }
 
     type = HOST_TYPE_IPV4;
-    if (parts > 0) {
-      val = numbers[parts - 1];
-      for (int n = 0; n < parts - 1; n++) {
-        double b = 3-n;
-        val += numbers[n] * pow(256, b);
-      }
+    val = numbers[parts - 1];
+    for (int n = 0; n < parts - 1; n++) {
+      double b = 3 - n;
+      val += numbers[n] * pow(256, b);
     }
 
     host->value.ipv4 = val;
@@ -369,17 +331,10 @@ namespace url {
     }
 
     // First, we have to percent decode
-    if (PercentDecode(input, length, &decoded) < 0)
-      goto end;
-
-    // If there are any invalid UTF8 byte sequences, we have to fail.
-    // Unfortunately this means iterating through the string and checking
-    // each decoded codepoint.
-    if (IsValidUTF8(&decoded) < 0)
-      goto end;
+    PercentDecode(input, length, &decoded);
 
     // Then we have to punycode toASCII
-    if (ToASCII(&decoded, &decoded) < 0)
+    if (!ToASCII(&decoded, &decoded))
       goto end;
 
     // If any of the following characters are still present, we have to fail
@@ -399,7 +354,7 @@ namespace url {
       goto end;
 
     // If the unicode flag is set, run the result through punycode ToUnicode
-    if (unicode && ToUnicode(&decoded, &decoded) < 0)
+    if (unicode && !ToUnicode(&decoded, &decoded))
       goto end;
 
     // It's not an IPv4 or IPv6 address, it must be a domain
@@ -493,20 +448,20 @@ namespace url {
     return host->type;
   }
 
-  static int ParseHost(std::string* input,
-                       std::string* output,
-                       bool unicode = false) {
+  static bool ParseHost(std::string* input,
+                        std::string* output,
+                        bool unicode = false) {
     if (input->length() == 0)
-      return 0;
+      return true;
     url_host host{{""}, HOST_TYPE_DOMAIN};
     ParseHost(&host, input->c_str(), input->length(), unicode);
     if (host.type == HOST_TYPE_FAILED)
-      return -1;
+      return false;
     WriteHost(&host, output);
-    return 0;
+    return true;
   }
 
-  static inline void Copy(Isolate* isolate,
+  static inline void Copy(Environment* env,
                           Local<Array> ary,
                           std::vector<std::string>* vec) {
     const int32_t len = ary->Length();
@@ -514,30 +469,34 @@ namespace url {
       return;  // nothing to copy
     vec->reserve(len);
     for (int32_t n = 0; n < len; n++) {
-      Local<Value> val = ary->Get(n);
+      Local<Value> val = ary->Get(env->context(), n).ToLocalChecked();
       if (val->IsString()) {
-        Utf8Value value(isolate, val.As<String>());
+        Utf8Value value(env->isolate(), val.As<String>());
         vec->push_back(std::string(*value, value.length()));
       }
     }
   }
 
-  static inline Local<Array> Copy(Isolate* isolate,
+  static inline Local<Array> Copy(Environment* env,
                                   std::vector<std::string> vec) {
+    Isolate* isolate = env->isolate();
     Local<Array> ary = Array::New(isolate, vec.size());
     for (size_t n = 0; n < vec.size(); n++)
-      ary->Set(n, UTF8STRING(isolate, vec[n]));
+      ary->Set(env->context(), n, UTF8STRING(isolate, vec[n])).FromJust();
     return ary;
   }
 
   static inline void HarvestBase(Environment* env,
                                  struct url_data* base,
                                  Local<Object> base_obj) {
+    Local<Context> context = env->context();
     Local<Value> flags = GET(env, base_obj, "flags");
     if (flags->IsInt32())
-      base->flags = flags->Int32Value();
+      base->flags = flags->Int32Value(context).FromJust();
 
-    GET_AND_SET(env, base_obj, scheme, base, URL_FLAGS_HAS_SCHEME);
+    Local<Value> scheme = GET(env, base_obj, "scheme");
+    base->scheme = Utf8Value(env->isolate(), scheme).out();
+
     GET_AND_SET(env, base_obj, username, base, URL_FLAGS_HAS_USERNAME);
     GET_AND_SET(env, base_obj, password, base, URL_FLAGS_HAS_PASSWORD);
     GET_AND_SET(env, base_obj, host, base, URL_FLAGS_HAS_HOST);
@@ -545,11 +504,11 @@ namespace url {
     GET_AND_SET(env, base_obj, fragment, base, URL_FLAGS_HAS_FRAGMENT);
     Local<Value> port = GET(env, base_obj, "port");
     if (port->IsInt32())
-      base->port = port->Int32Value();
+      base->port = port->Int32Value(context).FromJust();
     Local<Value> path = GET(env, base_obj, "path");
     if (path->IsArray()) {
       base->flags |= URL_FLAGS_HAS_PATH;
-      Copy(env->isolate(), path.As<Array>(), &(base->path));
+      Copy(env, path.As<Array>(), &(base->path));
     }
   }
 
@@ -558,7 +517,7 @@ namespace url {
                                     Local<Object> context_obj) {
     Local<Value> flags = GET(env, context_obj, "flags");
     if (flags->IsInt32()) {
-      int32_t _flags = flags->Int32Value();
+      int32_t _flags = flags->Int32Value(env->context()).FromJust();
       if (_flags & URL_FLAGS_SPECIAL)
         context->flags |= URL_FLAGS_SPECIAL;
       if (_flags & URL_FLAGS_CANNOT_BE_BASE)
@@ -571,7 +530,7 @@ namespace url {
     }
     Local<Value> port = GET(env, context_obj, "port");
     if (port->IsInt32())
-      context->port = port->Int32Value();
+      context->port = port->Int32Value(env->context()).FromJust();
   }
 
   // Single dot segment can be ".", "%2e", or "%2E"
@@ -618,53 +577,46 @@ namespace url {
     }
   }
 
-  static void Parse(Environment* env,
-                    Local<Value> recv,
-                    const char* input,
-                    const size_t len,
-                    enum url_parse_state override,
-                    Local<Object> base_obj,
-                    Local<Object> context_obj,
-                    Local<Function> cb) {
-    Isolate* isolate = env->isolate();
-    Local<Context> context = env->context();
-    HandleScope handle_scope(isolate);
-    Context::Scope context_scope(context);
+  static inline void ShortenUrlPath(struct url_data* url) {
+    if (url->path.empty()) return;
+    if (url->path.size() == 1 && url->scheme == "file:" &&
+        NORMALIZED_WINDOWS_DRIVE_LETTER(url->path[0])) return;
+    url->path.pop_back();
+  }
 
-    const bool has_base = base_obj->IsObject();
+  void URL::Parse(const char* input,
+                  const size_t len,
+                  enum url_parse_state state_override,
+                  struct url_data* url,
+                  const struct url_data* base,
+                  bool has_base) {
     bool atflag = false;
     bool sbflag = false;
     bool uflag = false;
     bool base_is_file = false;
     int wskip = 0;
 
-    struct url_data base;
-    struct url_data url;
-    if (context_obj->IsObject())
-      HarvestContext(env, &url, context_obj);
-    if (has_base)
-      HarvestBase(env, &base, base_obj);
-
     std::string buffer;
-    url.scheme.reserve(len);
-    url.username.reserve(len);
-    url.password.reserve(len);
-    url.host.reserve(len);
-    url.path.reserve(len);
-    url.query.reserve(len);
-    url.fragment.reserve(len);
+    url->scheme.reserve(len);
+    url->username.reserve(len);
+    url->password.reserve(len);
+    url->host.reserve(len);
+    url->path.reserve(len);
+    url->query.reserve(len);
+    url->fragment.reserve(len);
     buffer.reserve(len);
 
     // Set the initial parse state.
-    const bool state_override = override != kUnknownState;
-    enum url_parse_state state = state_override ? override : kSchemeStart;
+    const bool has_state_override = state_override != kUnknownState;
+    enum url_parse_state state = has_state_override ? state_override :
+                                                      kSchemeStart;
 
     const char* p = input;
     const char* end = input + len;
 
     if (state < kSchemeStart || state > kFragment) {
-      INVALID_PARSE_STATE();
-      goto done;
+      url->flags |= URL_FLAGS_INVALID_PARSE_STATE;
+      return;
     }
 
     while (p <= end) {
@@ -682,18 +634,20 @@ namespace url {
         continue;
       }
 
-      bool special = url.flags & URL_FLAGS_SPECIAL;
+      bool special = (url->flags & URL_FLAGS_SPECIAL);
+      bool cannot_be_base;
       const bool special_back_slash = (special && ch == '\\');
       switch (state) {
         case kSchemeStart:
           if (ASCII_ALPHA(ch)) {
             buffer += TO_LOWER(ch);
             state = kScheme;
-          } else if (!state_override) {
+          } else if (!has_state_override) {
             state = kNoScheme;
             continue;
           } else {
-            TERMINATE()
+            url->flags |= URL_FLAGS_FAILED;
+            return;
           }
           break;
         case kScheme:
@@ -701,26 +655,28 @@ namespace url {
             buffer += TO_LOWER(ch);
             p++;
             continue;
-          } else if (ch == ':' || (state_override && ch == kEOL)) {
-            buffer += ':';
+          } else if (ch == ':' || (has_state_override && ch == kEOL)) {
             if (buffer.size() > 0) {
-              SET_HAVE_SCHEME()
-              url.scheme = buffer;
+              buffer += ':';
+              url->scheme = buffer;
+            } else if (has_state_override) {
+              url->flags |= URL_FLAGS_TERMINATED;
+              return;
             }
-            if (IsSpecial(url.scheme)) {
-              SPECIAL()
+            if (IsSpecial(url->scheme)) {
+              url->flags |= URL_FLAGS_SPECIAL;
+              special = true;
             } else {
-              url.flags &= ~URL_FLAGS_SPECIAL;
+              url->flags &= ~URL_FLAGS_SPECIAL;
             }
-            if (state_override)
-              goto done;
+            if (has_state_override)
+              return;
             buffer.clear();
-            if (url.scheme == "file:") {
+            if (url->scheme == "file:") {
               state = kFile;
             } else if (special &&
                        has_base &&
-                       DOES_HAVE_SCHEME(base) &&
-                       url.scheme == base.scheme) {
+                       url->scheme == base->scheme) {
               state = kSpecialRelativeOrAuthority;
             } else if (special) {
               state = kSpecialAuthoritySlashes;
@@ -728,54 +684,56 @@ namespace url {
               state = kPathOrAuthority;
               p++;
             } else {
-              CANNOT_BE_BASE()
-              SET_HAVE_PATH()
-              url.path.push_back("");
+              url->flags |= URL_FLAGS_CANNOT_BE_BASE;
+              url->flags |= URL_FLAGS_HAS_PATH;
+              url->path.push_back("");
               state = kCannotBeBase;
             }
-          } else if (!state_override) {
+          } else if (!has_state_override) {
             buffer.clear();
             state = kNoScheme;
             p = input;
             continue;
           } else {
-            TERMINATE()
+            url->flags |= URL_FLAGS_FAILED;
+            return;
           }
           break;
         case kNoScheme:
-          if (!has_base || (IS_CANNOT_BE_BASE(base.flags) && ch != '#')) {
-            FAILED()
-          } else if (IS_CANNOT_BE_BASE(base.flags) && ch == '#') {
-            SET_HAVE_SCHEME()
-            url.scheme = base.scheme;
-            if (IsSpecial(url.scheme)) {
-              SPECIAL()
+          cannot_be_base = base->flags & URL_FLAGS_CANNOT_BE_BASE;
+          if (!has_base || (cannot_be_base && ch != '#')) {
+            url->flags |= URL_FLAGS_FAILED;
+            return;
+          } else if (cannot_be_base && ch == '#') {
+            url->scheme = base->scheme;
+            if (IsSpecial(url->scheme)) {
+              url->flags |= URL_FLAGS_SPECIAL;
+              special = true;
             } else {
-              url.flags &= ~URL_FLAGS_SPECIAL;
+              url->flags &= ~URL_FLAGS_SPECIAL;
             }
-            if (DOES_HAVE_PATH(base)) {
-              SET_HAVE_PATH()
-              url.path = base.path;
+            if (base->flags & URL_FLAGS_HAS_PATH) {
+              url->flags |= URL_FLAGS_HAS_PATH;
+              url->path = base->path;
             }
-            if (DOES_HAVE_QUERY(base)) {
-              SET_HAVE_QUERY()
-              url.query = base.query;
+            if (base->flags & URL_FLAGS_HAS_QUERY) {
+              url->flags |= URL_FLAGS_HAS_QUERY;
+              url->query = base->query;
             }
-            if (DOES_HAVE_FRAGMENT(base)) {
-              SET_HAVE_FRAGMENT()
-              url.fragment = base.fragment;
+            if (base->flags & URL_FLAGS_HAS_FRAGMENT) {
+              url->flags |= URL_FLAGS_HAS_FRAGMENT;
+              url->fragment = base->fragment;
             }
-            CANNOT_BE_BASE()
+            url->flags |= URL_FLAGS_CANNOT_BE_BASE;
             state = kFragment;
           } else if (has_base &&
-                     DOES_HAVE_SCHEME(base) &&
-                     base.scheme != "file:") {
+                     base->scheme != "file:") {
             state = kRelative;
             continue;
           } else {
-            SET_HAVE_SCHEME()
-            url.scheme = "file:";
-            SPECIAL()
+            url->scheme = "file:";
+            url->flags |= URL_FLAGS_SPECIAL;
+            special = true;
             state = kFile;
             continue;
           }
@@ -798,129 +756,130 @@ namespace url {
           }
           break;
         case kRelative:
-          SET_HAVE_SCHEME()
-          url.scheme = base.scheme;
-          if (IsSpecial(url.scheme)) {
-            SPECIAL()
+          url->scheme = base->scheme;
+          if (IsSpecial(url->scheme)) {
+            url->flags |= URL_FLAGS_SPECIAL;
+            special = true;
           } else {
-            url.flags &= ~URL_FLAGS_SPECIAL;
+            url->flags &= ~URL_FLAGS_SPECIAL;
           }
           switch (ch) {
             case kEOL:
-              if (DOES_HAVE_USERNAME(base)) {
-                SET_HAVE_USERNAME()
-                url.username = base.username;
+              if (base->flags & URL_FLAGS_HAS_USERNAME) {
+                url->flags |= URL_FLAGS_HAS_USERNAME;
+                url->username = base->username;
               }
-              if (DOES_HAVE_PASSWORD(base)) {
-                SET_HAVE_PASSWORD()
-                url.password = base.password;
+              if (base->flags & URL_FLAGS_HAS_PASSWORD) {
+                url->flags |= URL_FLAGS_HAS_PASSWORD;
+                url->password = base->password;
               }
-              if (DOES_HAVE_HOST(base)) {
-                SET_HAVE_HOST()
-                url.host = base.host;
+              if (base->flags & URL_FLAGS_HAS_HOST) {
+                url->flags |= URL_FLAGS_HAS_HOST;
+                url->host = base->host;
               }
-              if (DOES_HAVE_QUERY(base)) {
-                SET_HAVE_QUERY()
-                url.query = base.query;
+              if (base->flags & URL_FLAGS_HAS_QUERY) {
+                url->flags |= URL_FLAGS_HAS_QUERY;
+                url->query = base->query;
               }
-              if (DOES_HAVE_PATH(base)) {
-                SET_HAVE_PATH()
-                url.path = base.path;
+              if (base->flags & URL_FLAGS_HAS_PATH) {
+                url->flags |= URL_FLAGS_HAS_PATH;
+                url->path = base->path;
               }
-              url.port = base.port;
+              url->port = base->port;
               break;
             case '/':
               state = kRelativeSlash;
               break;
             case '?':
-              if (DOES_HAVE_USERNAME(base)) {
-                SET_HAVE_USERNAME()
-                url.username = base.username;
+              if (base->flags & URL_FLAGS_HAS_USERNAME) {
+                url->flags |= URL_FLAGS_HAS_USERNAME;
+                url->username = base->username;
               }
-              if (DOES_HAVE_PASSWORD(base)) {
-                SET_HAVE_PASSWORD()
-                url.password = base.password;
+              if (base->flags & URL_FLAGS_HAS_PASSWORD) {
+                url->flags |= URL_FLAGS_HAS_PASSWORD;
+                url->password = base->password;
               }
-              if (DOES_HAVE_HOST(base)) {
-                SET_HAVE_HOST()
-                url.host = base.host;
+              if (base->flags & URL_FLAGS_HAS_HOST) {
+                url->flags |= URL_FLAGS_HAS_HOST;
+                url->host = base->host;
               }
-              if (DOES_HAVE_PATH(base)) {
-                SET_HAVE_PATH()
-                url.path = base.path;
+              if (base->flags & URL_FLAGS_HAS_PATH) {
+                url->flags |= URL_FLAGS_HAS_PATH;
+                url->path = base->path;
               }
-              url.port = base.port;
+              url->port = base->port;
               state = kQuery;
               break;
             case '#':
-              if (DOES_HAVE_USERNAME(base)) {
-                SET_HAVE_USERNAME()
-                url.username = base.username;
+              if (base->flags & URL_FLAGS_HAS_USERNAME) {
+                url->flags |= URL_FLAGS_HAS_USERNAME;
+                url->username = base->username;
               }
-              if (DOES_HAVE_PASSWORD(base)) {
-                SET_HAVE_PASSWORD()
-                url.password = base.password;
+              if (base->flags & URL_FLAGS_HAS_PASSWORD) {
+                url->flags |= URL_FLAGS_HAS_PASSWORD;
+                url->password = base->password;
               }
-              if (DOES_HAVE_HOST(base)) {
-                SET_HAVE_HOST()
-                url.host = base.host;
+              if (base->flags & URL_FLAGS_HAS_HOST) {
+                url->flags |= URL_FLAGS_HAS_HOST;
+                url->host = base->host;
               }
-              if (DOES_HAVE_QUERY(base)) {
-                SET_HAVE_QUERY()
-                url.query = base.query;
+              if (base->flags & URL_FLAGS_HAS_QUERY) {
+                url->flags |= URL_FLAGS_HAS_QUERY;
+                url->query = base->query;
               }
-              if (DOES_HAVE_PATH(base)) {
-                SET_HAVE_PATH()
-                url.path = base.path;
+              if (base->flags & URL_FLAGS_HAS_PATH) {
+                url->flags |= URL_FLAGS_HAS_PATH;
+                url->path = base->path;
               }
-              url.port = base.port;
+              url->port = base->port;
               state = kFragment;
               break;
             default:
               if (special_back_slash) {
                 state = kRelativeSlash;
               } else {
-                if (DOES_HAVE_USERNAME(base)) {
-                  SET_HAVE_USERNAME()
-                  url.username = base.username;
+                if (base->flags & URL_FLAGS_HAS_USERNAME) {
+                  url->flags |= URL_FLAGS_HAS_USERNAME;
+                  url->username = base->username;
                 }
-                if (DOES_HAVE_PASSWORD(base)) {
-                  SET_HAVE_PASSWORD()
-                  url.password = base.password;
+                if (base->flags & URL_FLAGS_HAS_PASSWORD) {
+                  url->flags |= URL_FLAGS_HAS_PASSWORD;
+                  url->password = base->password;
                 }
-                if (DOES_HAVE_HOST(base)) {
-                  SET_HAVE_HOST()
-                  url.host = base.host;
+                if (base->flags & URL_FLAGS_HAS_HOST) {
+                  url->flags |= URL_FLAGS_HAS_HOST;
+                  url->host = base->host;
                 }
-                if (DOES_HAVE_PATH(base)) {
-                  SET_HAVE_PATH()
-                  url.path = base.path;
-                  if (!url.path.empty())
-                    url.path.pop_back();
+                if (base->flags & URL_FLAGS_HAS_PATH) {
+                  url->flags |= URL_FLAGS_HAS_PATH;
+                  url->path = base->path;
+                  ShortenUrlPath(url);
                 }
-                url.port = base.port;
+                url->port = base->port;
                 state = kPath;
                 continue;
               }
           }
           break;
         case kRelativeSlash:
-          if (ch == '/' || special_back_slash) {
+          if (IsSpecial(url->scheme) && (ch == '/' || ch == '\\')) {
             state = kSpecialAuthorityIgnoreSlashes;
+          } else if (ch == '/') {
+            state = kAuthority;
           } else {
-            if (DOES_HAVE_USERNAME(base)) {
-              SET_HAVE_USERNAME()
-              url.username = base.username;
+            if (base->flags & URL_FLAGS_HAS_USERNAME) {
+              url->flags |= URL_FLAGS_HAS_USERNAME;
+              url->username = base->username;
             }
-            if (DOES_HAVE_PASSWORD(base)) {
-              SET_HAVE_PASSWORD()
-              url.password = base.password;
+            if (base->flags & URL_FLAGS_HAS_PASSWORD) {
+              url->flags |= URL_FLAGS_HAS_PASSWORD;
+              url->password = base->password;
             }
-            if (DOES_HAVE_HOST(base)) {
-              SET_HAVE_HOST()
-              url.host = base.host;
+            if (base->flags & URL_FLAGS_HAS_HOST) {
+              url->flags |= URL_FLAGS_HAS_HOST;
+              url->host = base->host;
             }
-            url.port = base.port;
+            url->port = base->port;
             state = kPath;
             continue;
           }
@@ -948,21 +907,21 @@ namespace url {
             atflag = true;
             const size_t blen = buffer.size();
             if (blen > 0 && buffer[0] != ':') {
-              SET_HAVE_USERNAME()
+              url->flags |= URL_FLAGS_HAS_USERNAME;
             }
             for (size_t n = 0; n < blen; n++) {
               const char bch = buffer[n];
               if (bch == ':') {
-                SET_HAVE_PASSWORD()
+                url->flags |= URL_FLAGS_HAS_PASSWORD;
                 if (!uflag) {
                   uflag = true;
                   continue;
                 }
               }
               if (uflag) {
-                AppendOrEscape(&url.password, bch, UserinfoEncodeSet);
+                AppendOrEscape(&url->password, bch, UserinfoEncodeSet);
               } else {
-                AppendOrEscape(&url.username, bch, UserinfoEncodeSet);
+                AppendOrEscape(&url->username, bch, UserinfoEncodeSet);
               }
             }
             buffer.clear();
@@ -981,30 +940,40 @@ namespace url {
         case kHost:
         case kHostname:
           if (ch == ':' && !sbflag) {
-            if (special && buffer.size() == 0)
-              FAILED()
-            SET_HAVE_HOST()
-            if (ParseHost(&buffer, &url.host) < 0)
-              FAILED()
+            if (special && buffer.size() == 0) {
+              url->flags |= URL_FLAGS_FAILED;
+              return;
+            }
+            url->flags |= URL_FLAGS_HAS_HOST;
+            if (!ParseHost(&buffer, &url->host)) {
+              url->flags |= URL_FLAGS_FAILED;
+              return;
+            }
             buffer.clear();
             state = kPort;
-            if (override == kHostname)
-              TERMINATE()
+            if (state_override == kHostname) {
+              return;
+            }
           } else if (ch == kEOL ||
                      ch == '/' ||
                      ch == '?' ||
                      ch == '#' ||
                      special_back_slash) {
             p--;
-            if (special && buffer.size() == 0)
-              FAILED()
-            SET_HAVE_HOST()
-            if (ParseHost(&buffer, &url.host) < 0)
-              FAILED()
+            if (special && buffer.size() == 0) {
+              url->flags |= URL_FLAGS_FAILED;
+              return;
+            }
+            url->flags |= URL_FLAGS_HAS_HOST;
+            if (!ParseHost(&buffer, &url->host)) {
+              url->flags |= URL_FLAGS_FAILED;
+              return;
+            }
             buffer.clear();
             state = kPathStart;
-            if (state_override)
-              TERMINATE()
+            if (has_state_override) {
+              return;
+            }
           } else {
             if (ch == '[')
               sbflag = true;
@@ -1016,7 +985,7 @@ namespace url {
         case kPort:
           if (ASCII_DIGIT(ch)) {
             buffer += ch;
-          } else if (state_override ||
+          } else if (has_state_override ||
                      ch == kEOL ||
                      ch == '/' ||
                      ch == '?' ||
@@ -1026,76 +995,92 @@ namespace url {
               int port = 0;
               for (size_t i = 0; i < buffer.size(); i++)
                 port = port * 10 + buffer[i] - '0';
-              if (port >= 0 && port <= 0xffff) {
-                url.port = NormalizePort(url.scheme, port);
-              } else if (!state_override) {
-                FAILED()
+              if (port < 0 || port > 0xffff) {
+                // TODO(TimothyGu): This hack is currently needed for the host
+                // setter since it needs access to hostname if it is valid, and
+                // if the FAILED flag is set the entire response to JS layer
+                // will be empty.
+                if (state_override == kHost)
+                  url->port = -1;
+                else
+                  url->flags |= URL_FLAGS_FAILED;
+                return;
               }
+              url->port = NormalizePort(url->scheme, port);
               buffer.clear();
+            } else if (has_state_override) {
+              // TODO(TimothyGu): Similar case as above.
+              if (state_override == kHost)
+                url->port = -1;
+              else
+                url->flags |= URL_FLAGS_TERMINATED;
+              return;
             }
             state = kPathStart;
             continue;
           } else {
-            FAILED();
+            url->flags |= URL_FLAGS_FAILED;
+            return;
           }
           break;
         case kFile:
           base_is_file = (
               has_base &&
-              DOES_HAVE_SCHEME(base) &&
-              base.scheme == "file:");
+              base->scheme == "file:");
           switch (ch) {
             case kEOL:
               if (base_is_file) {
-                if (DOES_HAVE_HOST(base)) {
-                  SET_HAVE_HOST()
-                  url.host = base.host;
+                if (base->flags & URL_FLAGS_HAS_HOST) {
+                  url->flags |= URL_FLAGS_HAS_HOST;
+                  url->host = base->host;
                 }
-                if (DOES_HAVE_PATH(base)) {
-                  SET_HAVE_PATH()
-                  url.path = base.path;
+                if (base->flags & URL_FLAGS_HAS_PATH) {
+                  url->flags |= URL_FLAGS_HAS_PATH;
+                  url->path = base->path;
                 }
-                if (DOES_HAVE_QUERY(base)) {
-                  SET_HAVE_QUERY()
-                  url.query = base.query;
+                if (base->flags & URL_FLAGS_HAS_QUERY) {
+                  url->flags |= URL_FLAGS_HAS_QUERY;
+                  url->query = base->query;
                 }
+                break;
               }
-              break;
+              state = kPath;
+              continue;
             case '\\':
             case '/':
               state = kFileSlash;
               break;
             case '?':
               if (base_is_file) {
-                if (DOES_HAVE_HOST(base)) {
-                  SET_HAVE_HOST()
-                  url.host = base.host;
+                if (base->flags & URL_FLAGS_HAS_HOST) {
+                  url->flags |= URL_FLAGS_HAS_HOST;
+                  url->host = base->host;
                 }
-                if (DOES_HAVE_PATH(base)) {
-                  SET_HAVE_PATH()
-                  url.path = base.path;
+                if (base->flags & URL_FLAGS_HAS_PATH) {
+                  url->flags |= URL_FLAGS_HAS_PATH;
+                  url->path = base->path;
                 }
-                SET_HAVE_QUERY()
+                url->flags |= URL_FLAGS_HAS_QUERY;
                 state = kQuery;
+                break;
               }
-              break;
             case '#':
               if (base_is_file) {
-                if (DOES_HAVE_HOST(base)) {
-                  SET_HAVE_HOST()
-                  url.host = base.host;
+                if (base->flags & URL_FLAGS_HAS_HOST) {
+                  url->flags |= URL_FLAGS_HAS_HOST;
+                  url->host = base->host;
                 }
-                if (DOES_HAVE_PATH(base)) {
-                  SET_HAVE_PATH()
-                  url.path = base.path;
+                if (base->flags & URL_FLAGS_HAS_PATH) {
+                  url->flags |= URL_FLAGS_HAS_PATH;
+                  url->path = base->path;
                 }
-                if (DOES_HAVE_QUERY(base)) {
-                  SET_HAVE_QUERY()
-                  url.query = base.query;
+                if (base->flags & URL_FLAGS_HAS_QUERY) {
+                  url->flags |= URL_FLAGS_HAS_QUERY;
+                  url->query = base->query;
                 }
                 state = kFragment;
+                break;
               }
-              break;
             default:
               if (base_is_file &&
                   (!WINDOWS_DRIVE_LETTER(ch, p[1]) ||
@@ -1104,16 +1089,15 @@ namespace url {
                     p[2] != '\\' &&
                     p[2] != '?' &&
                     p[2] != '#'))) {
-                if (DOES_HAVE_HOST(base)) {
-                  SET_HAVE_HOST()
-                  url.host = base.host;
+                if (base->flags & URL_FLAGS_HAS_HOST) {
+                  url->flags |= URL_FLAGS_HAS_HOST;
+                  url->host = base->host;
                 }
-                if (DOES_HAVE_PATH(base)) {
-                  SET_HAVE_PATH()
-                  url.path = base.path;
+                if (base->flags & URL_FLAGS_HAS_PATH) {
+                  url->flags |= URL_FLAGS_HAS_PATH;
+                  url->path = base->path;
                 }
-                if (!url.path.empty())
-                  url.path.pop_back();
+                ShortenUrlPath(url);
               }
               state = kPath;
               continue;
@@ -1124,13 +1108,14 @@ namespace url {
             state = kFileHost;
           } else {
             if (has_base &&
-                DOES_HAVE_SCHEME(base) &&
-                base.scheme == "file:" &&
-                DOES_HAVE_PATH(base) &&
-                base.path.size() > 0 &&
-                NORMALIZED_WINDOWS_DRIVE_LETTER(base.path[0])) {
-              SET_HAVE_PATH()
-              url.path.push_back(base.path[0]);
+                base->scheme == "file:") {
+              if (NORMALIZED_WINDOWS_DRIVE_LETTER(base->path[0])) {
+                url->flags |= URL_FLAGS_HAS_PATH;
+                url->path.push_back(base->path[0]);
+              } else {
+                url->flags |= URL_FLAGS_HAS_HOST;
+                url->host = base->host;
+              }
             }
             state = kPath;
             continue;
@@ -1149,9 +1134,11 @@ namespace url {
               state = kPathStart;
             } else {
               if (buffer != "localhost") {
-                SET_HAVE_HOST()
-                if (ParseHost(&buffer, &url.host) < 0)
-                  FAILED()
+                url->flags |= URL_FLAGS_HAS_HOST;
+                if (!ParseHost(&buffer, &url->host)) {
+                  url->flags |= URL_FLAGS_FAILED;
+                  return;
+                }
               }
               buffer.clear();
               state = kPathStart;
@@ -1162,54 +1149,71 @@ namespace url {
           }
           break;
         case kPathStart:
-          state = kPath;
-          if (ch != '/' && !special_back_slash)
-            continue;
+          if (IsSpecial(url->scheme)) {
+            state = kPath;
+            if (ch != '/' && ch != '\\') {
+              continue;
+            }
+          } else if (!has_state_override && ch == '?') {
+            url->flags |= URL_FLAGS_HAS_QUERY;
+            url->query.clear();
+            state = kQuery;
+          } else if (!has_state_override && ch == '#') {
+            url->flags |= URL_FLAGS_HAS_FRAGMENT;
+            url->fragment.clear();
+            state = kFragment;
+          } else if (ch != kEOL) {
+            state = kPath;
+            if (ch != '/') {
+              continue;
+            }
+          }
           break;
         case kPath:
           if (ch == kEOL ||
               ch == '/' ||
               special_back_slash ||
-              (!state_override && (ch == '?' || ch == '#'))) {
+              (!has_state_override && (ch == '?' || ch == '#'))) {
             if (IsDoubleDotSegment(buffer)) {
-              if (!url.path.empty())
-                url.path.pop_back();
+              ShortenUrlPath(url);
               if (ch != '/' && !special_back_slash) {
-                SET_HAVE_PATH()
-                url.path.push_back("");
+                url->flags |= URL_FLAGS_HAS_PATH;
+                url->path.push_back("");
               }
             } else if (IsSingleDotSegment(buffer)) {
               if (ch != '/' && !special_back_slash) {
-                SET_HAVE_PATH();
-                url.path.push_back("");
+                url->flags |= URL_FLAGS_HAS_PATH;
+                url->path.push_back("");
               }
-            } else {
-              if (DOES_HAVE_SCHEME(url) &&
-                  url.scheme == "file:" &&
-                  url.path.empty() &&
+            } else if (!IsSingleDotSegment(buffer)) {
+              if (url->scheme == "file:" &&
+                  url->path.empty() &&
                   buffer.size() == 2 &&
                   WINDOWS_DRIVE_LETTER(buffer[0], buffer[1])) {
-                url.flags &= ~URL_FLAGS_HAS_HOST;
+                url->flags &= ~URL_FLAGS_HAS_HOST;
                 buffer[1] = ':';
               }
-              SET_HAVE_PATH()
+              url->flags |= URL_FLAGS_HAS_PATH;
               std::string segment(buffer.c_str(), buffer.size());
-              url.path.push_back(segment);
+              url->path.push_back(segment);
             }
             buffer.clear();
+            if (url->scheme == "file:" &&
+                (ch == kEOL ||
+                 ch == '?' ||
+                 ch == '#')) {
+              while (url->path.size() > 1 && url->path[0].length() == 0) {
+                url->path.erase(url->path.begin());
+              }
+            }
             if (ch == '?') {
-              SET_HAVE_QUERY()
+              url->flags |= URL_FLAGS_HAS_QUERY;
               state = kQuery;
             } else if (ch == '#') {
               state = kFragment;
             }
           } else {
-            if (ch == '%' && p[1] == '2' && TO_LOWER(p[2]) == 'e') {
-              buffer += '.';
-              p += 2;
-            } else {
-              AppendOrEscape(&buffer, ch, DefaultEncodeSet);
-            }
+            AppendOrEscape(&buffer, ch, DefaultEncodeSet);
           }
           break;
         case kCannotBeBase:
@@ -1221,16 +1225,16 @@ namespace url {
               state = kFragment;
               break;
             default:
-              if (url.path.size() == 0)
-                url.path.push_back("");
-              if (url.path.size() > 0 && ch != kEOL)
-                AppendOrEscape(&url.path[0], ch, SimpleEncodeSet);
+              if (url->path.size() == 0)
+                url->path.push_back("");
+              if (url->path.size() > 0 && ch != kEOL)
+                AppendOrEscape(&url->path[0], ch, SimpleEncodeSet);
           }
           break;
         case kQuery:
-          if (ch == kEOL || (!state_override && ch == '#')) {
-            SET_HAVE_QUERY()
-            url.query = buffer;
+          if (ch == kEOL || (!has_state_override && ch == '#')) {
+            url->flags |= URL_FLAGS_HAS_QUERY;
+            url->query = buffer;
             buffer.clear();
             if (ch == '#')
               state = kFragment;
@@ -1241,84 +1245,129 @@ namespace url {
         case kFragment:
           switch (ch) {
             case kEOL:
-              SET_HAVE_FRAGMENT()
-              url.fragment = buffer;
+              url->flags |= URL_FLAGS_HAS_FRAGMENT;
+              url->fragment = buffer;
               break;
             case 0:
               break;
             default:
-              buffer += ch;
+              AppendOrEscape(&buffer, ch, SimpleEncodeSet);
           }
           break;
         default:
-          INVALID_PARSE_STATE()
-          goto done;
+          url->flags |= URL_FLAGS_INVALID_PARSE_STATE;
+          return;
       }
 
       p++;
     }
+  }
 
-   done:
+  static inline void SetArgs(Environment* env,
+                             Local<Value> argv[],
+                             const struct url_data* url) {
+    Isolate* isolate = env->isolate();
+    argv[ARG_FLAGS] = Integer::NewFromUnsigned(isolate, url->flags);
+    argv[ARG_PROTOCOL] = OneByteString(isolate, url->scheme.c_str());
+    if (url->flags & URL_FLAGS_HAS_USERNAME)
+      argv[ARG_USERNAME] = UTF8STRING(isolate, url->username);
+    if (url->flags & URL_FLAGS_HAS_PASSWORD)
+      argv[ARG_PASSWORD] = UTF8STRING(isolate, url->password);
+    if (url->flags & URL_FLAGS_HAS_HOST)
+      argv[ARG_HOST] = UTF8STRING(isolate, url->host);
+    if (url->flags & URL_FLAGS_HAS_QUERY)
+      argv[ARG_QUERY] = UTF8STRING(isolate, url->query);
+    if (url->flags & URL_FLAGS_HAS_FRAGMENT)
+      argv[ARG_FRAGMENT] = UTF8STRING(isolate, url->fragment);
+    if (url->port > -1)
+      argv[ARG_PORT] = Integer::New(isolate, url->port);
+    if (url->flags & URL_FLAGS_HAS_PATH)
+      argv[ARG_PATH] = Copy(env, url->path);
+  }
+
+  static void Parse(Environment* env,
+                    Local<Value> recv,
+                    const char* input,
+                    const size_t len,
+                    enum url_parse_state state_override,
+                    Local<Value> base_obj,
+                    Local<Value> context_obj,
+                    Local<Function> cb,
+                    Local<Value> error_cb) {
+    Isolate* isolate = env->isolate();
+    Local<Context> context = env->context();
+    HandleScope handle_scope(isolate);
+    Context::Scope context_scope(context);
+
+    const bool has_base = base_obj->IsObject();
+
+    struct url_data base;
+    struct url_data url;
+    if (context_obj->IsObject())
+      HarvestContext(env, &url, context_obj.As<Object>());
+    if (has_base)
+      HarvestBase(env, &base, base_obj.As<Object>());
+
+    URL::Parse(input, len, state_override, &url, &base, has_base);
+    if ((url.flags & URL_FLAGS_INVALID_PARSE_STATE) ||
+        ((state_override != kUnknownState) &&
+         (url.flags & URL_FLAGS_TERMINATED)))
+      return;
 
     // Define the return value placeholders
     const Local<Value> undef = Undefined(isolate);
-    Local<Value> argv[9] = {
-      undef,
-      undef,
-      undef,
-      undef,
-      undef,
-      undef,
-      undef,
-      undef,
-      undef,
-    };
-
-    argv[ARG_FLAGS] = Integer::NewFromUnsigned(isolate, url.flags);
-    if (!IS_FAILED(url.flags)) {
-      if (DOES_HAVE_SCHEME(url))
-        argv[ARG_PROTOCOL] = OneByteString(isolate, url.scheme.c_str());
-      if (DOES_HAVE_USERNAME(url))
-        argv[ARG_USERNAME] = UTF8STRING(isolate, url.username);
-      if (DOES_HAVE_PASSWORD(url))
-        argv[ARG_PASSWORD] = UTF8STRING(isolate, url.password);
-      if (DOES_HAVE_HOST(url))
-        argv[ARG_HOST] = UTF8STRING(isolate, url.host);
-      if (DOES_HAVE_QUERY(url))
-        argv[ARG_QUERY] = UTF8STRING(isolate, url.query);
-      if (DOES_HAVE_FRAGMENT(url))
-        argv[ARG_FRAGMENT] = UTF8STRING(isolate, url.fragment);
-      if (url.port > -1)
-        argv[ARG_PORT] = Integer::New(isolate, url.port);
-      if (DOES_HAVE_PATH(url))
-        argv[ARG_PATH] = Copy(isolate, url.path);
+    if (!(url.flags & URL_FLAGS_FAILED)) {
+      Local<Value> argv[9] = {
+        undef,
+        undef,
+        undef,
+        undef,
+        undef,
+        undef,
+        undef,
+        undef,
+        undef,
+      };
+      SetArgs(env, argv, &url);
+      (void)cb->Call(context, recv, arraysize(argv), argv);
+    } else if (error_cb->IsFunction()) {
+      Local<Value> argv[2] = { undef, undef };
+      argv[ERR_ARG_FLAGS] = Integer::NewFromUnsigned(isolate, url.flags);
+      argv[ERR_ARG_INPUT] =
+        String::NewFromUtf8(env->isolate(),
+                            input,
+                            v8::NewStringType::kNormal).ToLocalChecked();
+      (void)error_cb.As<Function>()->Call(context, recv, arraysize(argv), argv);
     }
-
-    cb->Call(context, recv, 9, argv);
   }
 
   static void Parse(const FunctionCallbackInfo<Value>& args) {
     Environment* env = Environment::GetCurrent(args);
     CHECK_GE(args.Length(), 5);
-    CHECK(args[0]->IsString());
-    CHECK(args[2]->IsUndefined() ||
+    CHECK(args[0]->IsString());  // input
+    CHECK(args[2]->IsUndefined() ||  // base context
           args[2]->IsNull() ||
           args[2]->IsObject());
-    CHECK(args[3]->IsUndefined() ||
+    CHECK(args[3]->IsUndefined() ||  // context
           args[3]->IsNull() ||
           args[3]->IsObject());
-    CHECK(args[4]->IsFunction());
+    CHECK(args[4]->IsFunction());  // complete callback
+    CHECK(args[5]->IsUndefined() || args[5]->IsFunction());  // error callback
+
     Utf8Value input(env->isolate(), args[0]);
-    enum url_parse_state override = kUnknownState;
-    if (args[1]->IsNumber())
-      override = (enum url_parse_state)(args[1]->Uint32Value());
+    enum url_parse_state state_override = kUnknownState;
+    if (args[1]->IsNumber()) {
+      state_override = static_cast<enum url_parse_state>(
+          args[1]->Uint32Value(env->context()).FromJust());
+    }
 
     Parse(env, args.This(),
           *input, input.length(),
-          override,
-          args[2].As<Object>(),
-          args[3].As<Object>(),
-          args[4].As<Function>());
+          state_override,
+          args[2],
+          args[3],
+          args[4].As<Function>(),
+          args[5]);
   }
 
   static void EncodeAuthSet(const FunctionCallbackInfo<Value>& args) {
@@ -1337,6 +1386,41 @@ namespace url {
         String::NewFromUtf8(env->isolate(),
                             output.c_str(),
                             v8::NewStringType::kNormal).ToLocalChecked());
+  }
+
+  static void ToUSVString(const FunctionCallbackInfo<Value>& args) {
+    Environment* env = Environment::GetCurrent(args);
+    CHECK_GE(args.Length(), 2);
+    CHECK(args[0]->IsString());
+    CHECK(args[1]->IsNumber());
+
+    TwoByteValue value(env->isolate(), args[0]);
+    const size_t n = value.length();
+
+    const int64_t start = args[1]->IntegerValue(env->context()).FromJust();
+    CHECK_GE(start, 0);
+
+    for (size_t i = start; i < n; i++) {
+      uint16_t c = value[i];
+      if (!IsUnicodeSurrogate(c)) {
+        continue;
+      } else if (IsUnicodeSurrogateTrail(c) || i == n - 1) {
+        value[i] = UNICODE_REPLACEMENT_CHARACTER;
+      } else {
+        uint16_t d = value[i + 1];
+        if (IsUnicodeTrail(d)) {
+          i++;
+        } else {
+          value[i] = UNICODE_REPLACEMENT_CHARACTER;
+        }
+      }
+    }
+
+    args.GetReturnValue().Set(
+        String::NewFromTwoByte(env->isolate(),
+                               *value,
+                               v8::NewStringType::kNormal,
+                               n).ToLocalChecked());
   }
 
   static void DomainToASCII(const FunctionCallbackInfo<Value>& args) {
@@ -1379,6 +1463,58 @@ namespace url {
                             v8::NewStringType::kNormal).ToLocalChecked());
   }
 
+  // This function works by calling out to a JS function that creates and
+  // returns the JS URL object. Be mindful of the JS<->Native boundary
+  // crossing that is required.
+  const Local<Value> URL::ToObject(Environment* env) const {
+    Isolate* isolate = env->isolate();
+    Local<Context> context = env->context();
+    HandleScope handle_scope(isolate);
+    Context::Scope context_scope(context);
+
+    const Local<Value> undef = Undefined(isolate);
+
+    if (context_.flags & URL_FLAGS_FAILED)
+      return Local<Value>();
+
+    Local<Value> argv[9] = {
+      undef,
+      undef,
+      undef,
+      undef,
+      undef,
+      undef,
+      undef,
+      undef,
+      undef,
+    };
+    SetArgs(env, argv, &context_);
+
+    TryCatch try_catch(isolate);
+
+    // The SetURLConstructor method must have been called already to
+    // set the constructor function used below. SetURLConstructor is
+    // called automatically when the internal/url.js module is loaded
+    // during the internal/bootstrap_node.js processing.
+    MaybeLocal<Value> ret =
+        env->url_constructor_function()
+            ->Call(env->context(), undef, 9, argv);
+
+    if (ret.IsEmpty()) {
+      ClearFatalExceptionHandlers(env);
+      FatalException(isolate, try_catch);
+    }
+
+    return ret.ToLocalChecked();
+  }
+
+  static void SetURLConstructor(const FunctionCallbackInfo<Value>& args) {
+    Environment* env = Environment::GetCurrent(args);
+    CHECK_EQ(args.Length(), 1);
+    CHECK(args[0]->IsFunction());
+    env->set_url_constructor_function(args[0].As<Function>());
+  }
+
   static void Init(Local<Object> target,
                    Local<Value> unused,
                    Local<Context> context,
@@ -1386,8 +1522,10 @@ namespace url {
     Environment* env = Environment::GetCurrent(context);
     env->SetMethod(target, "parse", Parse);
     env->SetMethod(target, "encodeAuth", EncodeAuthSet);
+    env->SetMethod(target, "toUSVString", ToUSVString);
     env->SetMethod(target, "domainToASCII", DomainToASCII);
     env->SetMethod(target, "domainToUnicode", DomainToUnicode);
+    env->SetMethod(target, "setURLConstructor", SetURLConstructor);
 
 #define XX(name, _) NODE_DEFINE_CONSTANT(target, name);
     FLAGS(XX)

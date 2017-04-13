@@ -1,3 +1,24 @@
+// Copyright Joyent, Inc. and other Node contributors.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a
+// copy of this software and associated documentation files (the
+// "Software"), to deal in the Software without restriction, including
+// without limitation the rights to use, copy, modify, merge, publish,
+// distribute, sublicense, and/or sell copies of the Software, and to permit
+// persons to whom the Software is furnished to do so, subject to the
+// following conditions:
+//
+// The above copyright notice and this permission notice shall be included
+// in all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN
+// NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
+// DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
+// OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
+// USE OR OTHER DEALINGS IN THE SOFTWARE.
+
 #ifndef SRC_ENV_INL_H_
 #define SRC_ENV_INL_H_
 
@@ -178,6 +199,7 @@ inline Environment::Environment(IsolateData* isolate_data,
 #endif
       handle_cleanup_waiting_(0),
       http_parser_buffer_(nullptr),
+      fs_stats_field_array_(nullptr),
       context_(context->GetIsolate(), context) {
   // We'll be creating new objects so make sure we've entered the context.
   v8::HandleScope handle_scope(isolate());
@@ -194,6 +216,8 @@ inline Environment::Environment(IsolateData* isolate_data,
 
   RB_INIT(&cares_task_list_);
   AssignToContext(context);
+
+  destroy_ids_list_.reserve(512);
 }
 
 inline Environment::~Environment() {
@@ -204,6 +228,19 @@ inline Environment::~Environment() {
     hc->cb_(this, hc->handle_, hc->arg_);
     delete hc;
   }
+
+  while (handle_cleanup_waiting_ != 0)
+    uv_run(event_loop(), UV_RUN_ONCE);
+
+  // Closing the destroy_ids_idle_handle_ within the handle cleanup queue
+  // prevents the async wrap destroy hook from being called.
+  uv_handle_t* handle =
+    reinterpret_cast<uv_handle_t*>(&destroy_ids_idle_handle_);
+  handle->data = this;
+  handle_cleanup_waiting_ = 1;
+  uv_close(handle, [](uv_handle_t* handle) {
+    static_cast<Environment*>(handle->data)->FinishHandleCleanup(handle);
+  });
 
   while (handle_cleanup_waiting_ != 0)
     uv_run(event_loop(), UV_RUN_ONCE);
@@ -245,6 +282,15 @@ inline uv_check_t* Environment::immediate_check_handle() {
 
 inline uv_idle_t* Environment::immediate_idle_handle() {
   return &immediate_idle_handle_;
+}
+
+inline Environment* Environment::from_destroy_ids_idle_handle(
+    uv_idle_t* handle) {
+  return ContainerOf(&Environment::destroy_ids_idle_handle_, handle);
+}
+
+inline uv_idle_t* Environment::destroy_ids_idle_handle() {
+  return &destroy_ids_idle_handle_;
 }
 
 inline void Environment::RegisterHandleCleanup(uv_handle_t* handle,
@@ -301,22 +347,26 @@ inline int64_t Environment::get_async_wrap_uid() {
   return ++async_wrap_uid_;
 }
 
-inline uint32_t* Environment::heap_statistics_buffer() const {
+inline std::vector<int64_t>* Environment::destroy_ids_list() {
+  return &destroy_ids_list_;
+}
+
+inline double* Environment::heap_statistics_buffer() const {
   CHECK_NE(heap_statistics_buffer_, nullptr);
   return heap_statistics_buffer_;
 }
 
-inline void Environment::set_heap_statistics_buffer(uint32_t* pointer) {
+inline void Environment::set_heap_statistics_buffer(double* pointer) {
   CHECK_EQ(heap_statistics_buffer_, nullptr);  // Should be set only once.
   heap_statistics_buffer_ = pointer;
 }
 
-inline uint32_t* Environment::heap_space_statistics_buffer() const {
+inline double* Environment::heap_space_statistics_buffer() const {
   CHECK_NE(heap_space_statistics_buffer_, nullptr);
   return heap_space_statistics_buffer_;
 }
 
-inline void Environment::set_heap_space_statistics_buffer(uint32_t* pointer) {
+inline void Environment::set_heap_space_statistics_buffer(double* pointer) {
   CHECK_EQ(heap_space_statistics_buffer_, nullptr);  // Should be set only once.
   heap_space_statistics_buffer_ = pointer;
 }
@@ -329,6 +379,15 @@ inline char* Environment::http_parser_buffer() const {
 inline void Environment::set_http_parser_buffer(char* buffer) {
   CHECK_EQ(http_parser_buffer_, nullptr);  // Should be set only once.
   http_parser_buffer_ = buffer;
+}
+
+inline double* Environment::fs_stats_field_array() const {
+  return fs_stats_field_array_;
+}
+
+inline void Environment::set_fs_stats_field_array(double* fields) {
+  CHECK_EQ(fs_stats_field_array_, nullptr);  // Should be set only once.
+  fs_stats_field_array_ = fields;
 }
 
 inline Environment* Environment::from_cares_timer_handle(uv_timer_t* handle) {

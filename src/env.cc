@@ -49,6 +49,9 @@ void Environment::Start(int argc,
   uv_unref(reinterpret_cast<uv_handle_t*>(&idle_prepare_handle_));
   uv_unref(reinterpret_cast<uv_handle_t*>(&idle_check_handle_));
 
+  uv_idle_init(event_loop(), destroy_ids_idle_handle());
+  uv_unref(reinterpret_cast<uv_handle_t*>(destroy_ids_idle_handle()));
+
   auto close_and_finish = [](Environment* env, uv_handle_t* handle, void* arg) {
     handle->data = env;
 
@@ -148,6 +151,17 @@ void Environment::PrintSyncTrace() const {
     }
   }
   fflush(stderr);
+}
+
+void Environment::RunAtExitCallbacks() {
+  for (AtExitCallback at_exit : at_exit_functions_) {
+    at_exit.cb_(at_exit.arg_);
+  }
+  at_exit_functions_.clear();
+}
+
+void Environment::AtExit(void (*cb)(void* arg), void* arg) {
+  at_exit_functions_.push_back(AtExitCallback{cb, arg});
 }
 
 }  // namespace node
